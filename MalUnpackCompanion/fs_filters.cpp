@@ -3,6 +3,23 @@
 
 namespace FltUtil {
 
+	NTSTATUS IsNonDefaultFileStream(PCFLT_RELATED_OBJECTS FltObjects, PFLT_CALLBACK_DATA Data, BOOLEAN& isNonDefault)
+	{
+		if (!Data || !FltObjects) {
+			return STATUS_INVALID_PARAMETER;
+		}
+		PFLT_FILE_NAME_INFORMATION pFileNameInfo = NULL;
+		NTSTATUS status = FltGetFileNameInformation(Data, FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &pFileNameInfo);
+		if (!NT_SUCCESS(status)) {
+			return status;
+		}
+		if (pFileNameInfo && pFileNameInfo->Stream.Length) {
+			isNonDefault = TRUE;
+		}
+		FltReleaseFileNameInformation(pFileNameInfo);
+		return status;
+	}
+
 	NTSTATUS GetFileId(PCFLT_RELATED_OBJECTS FltObjects, PFLT_CALLBACK_DATA Data, LONGLONG& FileId, char *caller)
 	{
 		UNREFERENCED_PARAMETER(caller);
@@ -57,7 +74,7 @@ namespace FltUtil {
 	//WARNING: use it only after the object is verified, otherwise it can cause crash!
 	NTSTATUS FltGetFileSize(PCFLT_RELATED_OBJECTS FltObjects, LONGLONG& myFileSize)
 	{
-		myFileSize = (-1);
+		myFileSize = INVALID_FILE_SIZE;
 		if (!FltObjects) {
 			return STATUS_INVALID_PARAMETER;
 		}
@@ -71,7 +88,7 @@ namespace FltUtil {
 
 	NTSTATUS GetFileSize(PCFLT_RELATED_OBJECTS FltObjects, PFLT_CALLBACK_DATA Data, LONGLONG& myFileSize)
 	{
-		myFileSize = (-1);
+		myFileSize = INVALID_FILE_SIZE;
 		if (!Data || !FltObjects) {
 			return STATUS_INVALID_PARAMETER;
 		}
@@ -130,7 +147,7 @@ namespace FltUtil {
 		return false;
 	}
 
-	bool IsCreateOrOverwrite(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects)
+	bool IsCreateOrOverwriteEmpty(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_OBJECTS FltObjects)
 	{
 		if (!Data || !FltObjects) return false;
 
@@ -140,13 +157,15 @@ namespace FltUtil {
 		const bool isAnyCreate = _IsAnyCreateOverwriteDisp(createDisposition);
 
 		// Retrieve file size:
-		LONGLONG FileSize = 0;
-		NTSTATUS fileSizeStatus = FltUtil::GetFileSize(FltObjects, Data, FileSize);
-		if (fileSizeStatus == STATUS_OBJECT_NAME_NOT_FOUND) {
+		LONGLONG FileSize = INVALID_FILE_SIZE;
+		const NTSTATUS fileSizeStatus = FltUtil::GetFileSize(FltObjects, Data, FileSize);
+
+		if (fileSizeStatus == STATUS_OBJECT_NAME_NOT_FOUND || 
+			fileSizeStatus == STATUS_OBJECT_PATH_NOT_FOUND)
+		{
 			FileSize = 0; //name not found, it is a new file
 		}
-
-		// Check if it is creating a new file:
+		// Check if it is creating a new file or replacing empty:
 		if ((FILE_CREATE == createDisposition)
 			|| ((FileSize == 0) && isAnyCreate))
 		{
@@ -231,7 +250,13 @@ FLT_PREOP_CALLBACK_STATUS MyFilterProtectPreCreate(PFLT_CALLBACK_DATA Data, PCFL
 	}
 
 	// Check if it is creating a new file:
-	if (FltUtil::IsCreateOrOverwrite(Data, FltObjects)) {
+	if (FltUtil::IsCreateOrOverwriteEmpty(Data, FltObjects)) {
+		BOOLEAN isAltStream = FALSE;
+		if (NT_SUCCESS(FltUtil::IsNonDefaultFileStream(FltObjects, Data, isAltStream)) && isAltStream) {
+			Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+			DbgPrint(DRIVER_PREFIX "[%d] WARNING: Creating Alternative Data Streams is forbidden\n", sourcePID);
+			return FLT_PREOP_COMPLETE;
+		}
 		// check if adding the file is possible:
 		if (!Data::CanAddFile(sourcePID)) {
 			Data->IoStatus.Status = STATUS_ACCESS_DENIED;
@@ -301,7 +326,6 @@ FLT_POSTOP_CALLBACK_STATUS MyFilterProtectPostCreate(PFLT_CALLBACK_DATA Data, PC
 	}
 
 	auto& params = Data->Iopb->Parameters.Create;
-
 	if (params.Options & FILE_DIRECTORY_FILE) {
 		// this is a directory, do not interfere
 		return FLT_POSTOP_FINISHED_PROCESSING;
@@ -320,8 +344,10 @@ FLT_POSTOP_CALLBACK_STATUS MyFilterProtectPostCreate(PFLT_CALLBACK_DATA Data, PC
 		return FLT_POSTOP_FINISHED_PROCESSING;
 	}
 
-	// Check if it is creating a new file:
-	if (FltUtil::IsCreateOrOverwrite(Data, FltObjects)) {
+	if (Data->IoStatus.Information == FILE_CREATED ||
+		Data->IoStatus.Information == FILE_OVERWRITTEN ||
+		Data->IoStatus.Information == FILE_SUPERSEDED)
+	{
 		DbgPrint(DRIVER_PREFIX "[%d][%s] Creating a new OWNED fileID: %zX fileIdStatus: %X\n", sourcePID, __FUNCTION__, fileId, fileIdStatus);
 		const PUNICODE_STRING fileName = (Data->Iopb->TargetFileObject) ? &Data->Iopb->TargetFileObject->FileName : nullptr;
 		if (fileName) {
@@ -337,6 +363,13 @@ FLT_POSTOP_CALLBACK_STATUS MyFilterProtectPostCreate(PFLT_CALLBACK_DATA Data, PC
 		}
 		if (add_status == ADD_FORBIDDEN) {
 			DbgPrint(DRIVER_PREFIX "[%llX][%s] Could not add to the file to watchlist: already associated with other process\n", fileId, __FUNCTION__);
+		}
+		// cancel the open operation if the file was not added to the list
+		if (add_status != ADD_OK && add_status != ADD_ALREADY_EXIST) {
+			FltCancelFileOpen(FltObjects->Instance, FltObjects->FileObject);
+			Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+			Data->IoStatus.Information = 0;
+			return FLT_POSTOP_FINISHED_PROCESSING;
 		}
 	}
 	return FLT_POSTOP_FINISHED_PROCESSING;
@@ -428,6 +461,14 @@ FLT_POSTOP_CALLBACK_STATUS MyPostCleanup(PFLT_CALLBACK_DATA Data, PCFLT_RELATED_
 	UNREFERENCED_PARAMETER(Flags);
 
 	PAGED_CODE();
+
+	if (Flags & FLTFL_POST_OPERATION_DRAINING) {
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	}
+
+	if (!NT_SUCCESS(Data->IoStatus.Status)) {
+		return FLT_POSTOP_FINISHED_PROCESSING;
+	}
 
 	FILE_STANDARD_INFORMATION fileInfo;
 	NTSTATUS status = FltQueryInformationFile(Data->Iopb->TargetInstance,
